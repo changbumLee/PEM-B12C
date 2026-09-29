@@ -103,6 +103,26 @@ class MaskFormerHead(nn.Module):
         return self.layers(features, mask)
 
     def layers(self, features, mask=None):
-        mask_features, transformer_encoder_features, multi_scale_features = self.pixel_decoder.forward_features(features)
-        predictions = self.predictor(multi_scale_features, mask_features, mask)
+        (
+            mask_features,
+            _transformer_encoder_features,
+            multi_scale_features,
+            csm_shape_pred,
+            csm_boundary_pred,
+        ) = self.pixel_decoder.forward_features(features)
+
+        predictions = self.predictor(
+            multi_scale_features,
+            mask_features,
+            mask,
+        )
+
+        if csm_shape_pred is not None:
+            predictions["csm_shape_pred"] = csm_shape_pred
+
+        if csm_boundary_pred is not None:
+            predictions["csm_boundary_pred"] = (
+                csm_boundary_pred
+            )
+
         return predictions

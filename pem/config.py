@@ -97,3 +97,26 @@ def add_maskformer2_config(cfg):
     # Importance sampling parameter for PointRend point sampling during training. Parametr `beta` in
     # the original paper.
     cfg.MODEL.MASK_FORMER.IMPORTANCE_SAMPLE_RATIO = 0.75
+
+    # ------------------------------------------------------------------
+    # Shape-Sensitivity-Aware Boundary Supervision
+    # ------------------------------------------------------------------
+# ------------------------------------------------------------------
+# Shape-Sensitivity-Aware Boundary Supervision
+# ------------------------------------------------------------------
+    cfg.MODEL.SSB = CN()
+    cfg.MODEL.SSB.ENABLED = False
+    cfg.MODEL.SSB.MAX_WEIGHT = 0.1
+    cfg.MODEL.SSB.WARMUP_START = 1000
+    cfg.MODEL.SSB.WARMUP_END = 5000
+    cfg.MODEL.SSB.MODE = "full"
+
+    # ------------------------------------------------------------------
+    # CSM feature-level shape supervision
+    # ------------------------------------------------------------------
+    cfg.MODEL.CSM_SHAPE = CN()
+    cfg.MODEL.CSM_SHAPE.ENABLED = False
+    cfg.MODEL.CSM_SHAPE.MAX_WEIGHT = 0.1
+    cfg.MODEL.CSM_SHAPE.WARMUP_START = 1000
+    cfg.MODEL.CSM_SHAPE.WARMUP_END = 5000
+    cfg.MODEL.CSM_SHAPE.BAND_KERNEL = 9

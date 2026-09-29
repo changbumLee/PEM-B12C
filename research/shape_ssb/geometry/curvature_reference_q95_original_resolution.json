@@ -1,0 +1,24 @@
+{
+  "dataset": "Cityscapes",
+  "split": "train",
+  "percentile": 95.0,
+  "radii": [
+    2,
+    4,
+    8
+  ],
+  "seed": 2026,
+  "max_samples_per_scale": 2000000,
+  "min_contour_points": 16,
+  "ignore_label": 255,
+  "references": {
+    "r2": 0.4146990180015564,
+    "r4": 0.29644593596458435,
+    "r8": 0.20070898532867432
+  },
+  "sample_counts": {
+    "r2": 2000000,
+    "r4": 2000000,
+    "r8": 2000000
+  }
+}

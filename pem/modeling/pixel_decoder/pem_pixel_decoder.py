@@ -189,7 +189,234 @@ class CSM(nn.Module):
         x_w = self.mlp(x_avg).sigmoid()
         return x + x * x_w
 
+class B8BoundaryExpert(nn.Module):
+    """
+    B8 boundary-presence expert.
 
+    Purpose:
+        Learn explicit GT boundary presence B while keeping
+        the auxiliary branch lightweight.
+
+    Input:
+        csm_4: [B, C, H, W]
+
+    Output:
+        boundary logits: [B, 1, H, W]
+    """
+
+    def __init__(self, in_channels: int):
+        super().__init__()
+
+        hidden = in_channels // 2
+        num_groups = 8 if hidden % 8 == 0 else 1
+
+        self.reduce = nn.Sequential(
+            nn.Conv2d(
+                in_channels,
+                hidden,
+                kernel_size=1,
+                bias=False,
+            ),
+            nn.GroupNorm(
+                num_groups,
+                hidden,
+            ),
+            nn.GELU(),
+        )
+
+        self.refine = nn.Sequential(
+            nn.Conv2d(
+                hidden,
+                hidden,
+                kernel_size=3,
+                padding=1,
+                bias=False,
+            ),
+            nn.GroupNorm(
+                num_groups,
+                hidden,
+            ),
+            nn.GELU(),
+
+            nn.Conv2d(
+                hidden,
+                hidden,
+                kernel_size=3,
+                padding=1,
+                bias=False,
+            ),
+            nn.GroupNorm(
+                num_groups,
+                hidden,
+            ),
+        )
+
+        self.act = nn.GELU()
+
+        self.out = nn.Conv2d(
+            hidden,
+            1,
+            kernel_size=1,
+            bias=True,
+        )
+
+    def forward(self, x):
+        base = self.reduce(x)
+
+        refined = self.refine(base)
+
+        feat = self.act(
+            base + refined
+        )
+
+        return self.out(feat)
+
+class B8ShapeExpert(nn.Module):
+    """
+    B8 multi-scale shape-sensitive expert.
+
+    The shape branch receives multiple local receptive fields
+    while preserving the B7 B*S target and one-sided loss.
+
+    Input:
+        csm_4: [B, C, H, W]
+
+    Output:
+        shape logits: [B, 1, H, W]
+    """
+
+    def __init__(self, in_channels: int):
+        super().__init__()
+
+        hidden = in_channels // 2
+        num_groups = 8 if hidden % 8 == 0 else 1
+
+        self.reduce = nn.Sequential(
+            nn.Conv2d(
+                in_channels,
+                hidden,
+                kernel_size=1,
+                bias=False,
+            ),
+            nn.GroupNorm(
+                num_groups,
+                hidden,
+            ),
+            nn.GELU(),
+        )
+
+        # Lightweight multi-scale spatial experts.
+        self.branch_d1 = nn.Sequential(
+            nn.Conv2d(
+                hidden,
+                hidden,
+                kernel_size=3,
+                padding=1,
+                dilation=1,
+                groups=hidden,
+                bias=False,
+            ),
+            nn.GroupNorm(
+                num_groups,
+                hidden,
+            ),
+            nn.GELU(),
+        )
+
+        self.branch_d2 = nn.Sequential(
+            nn.Conv2d(
+                hidden,
+                hidden,
+                kernel_size=3,
+                padding=2,
+                dilation=2,
+                groups=hidden,
+                bias=False,
+            ),
+            nn.GroupNorm(
+                num_groups,
+                hidden,
+            ),
+            nn.GELU(),
+        )
+
+        self.branch_d4 = nn.Sequential(
+            nn.Conv2d(
+                hidden,
+                hidden,
+                kernel_size=3,
+                padding=4,
+                dilation=4,
+                groups=hidden,
+                bias=False,
+            ),
+            nn.GroupNorm(
+                num_groups,
+                hidden,
+            ),
+            nn.GELU(),
+        )
+
+        self.fuse = nn.Sequential(
+            nn.Conv2d(
+                hidden * 3,
+                hidden,
+                kernel_size=1,
+                bias=False,
+            ),
+            nn.GroupNorm(
+                num_groups,
+                hidden,
+            ),
+            nn.GELU(),
+
+            nn.Conv2d(
+                hidden,
+                hidden,
+                kernel_size=3,
+                padding=1,
+                bias=False,
+            ),
+            nn.GroupNorm(
+                num_groups,
+                hidden,
+            ),
+        )
+
+        self.act = nn.GELU()
+
+        self.out = nn.Conv2d(
+            hidden,
+            1,
+            kernel_size=1,
+            bias=True,
+        )
+
+    def forward(self, x):
+        base = self.reduce(x)
+
+        feat_d1 = self.branch_d1(base)
+        feat_d2 = self.branch_d2(base)
+        feat_d4 = self.branch_d4(base)
+
+        multi_scale = torch.cat(
+            [
+                feat_d1,
+                feat_d2,
+                feat_d4,
+            ],
+            dim=1,
+        )
+
+        refined = self.fuse(
+            multi_scale
+        )
+
+        feat = self.act(
+            base + refined
+        )
+
+        return self.out(feat)
 @SEM_SEG_HEADS_REGISTRY.register()
 class PEM_Pixel_Decoder(nn.Module):
     @configurable
@@ -200,6 +427,7 @@ class PEM_Pixel_Decoder(nn.Module):
         conv_dim: int,
         mask_dim: int,
         norm: Optional[Union[str, Callable]] = None,
+        csm_shape_enabled: bool = False,
     ):
         """
         NOTE: this interface is experimental.
@@ -221,8 +449,84 @@ class PEM_Pixel_Decoder(nn.Module):
 
         self.csm = nn.ModuleList([CSM(conv_dim, factor=2, norm=norm) for _ in range(4)])
         self.dcn = nn.ModuleList([DeformLayer(conv_dim, conv_dim, norm=norm) for _ in range(3)])
+        self.csm_shape_enabled = bool(csm_shape_enabled)
 
-        self.out = ConvBNReLU(conv_dim, mask_dim, 1, padding=0, norm=norm)
+        self.out = ConvBNReLU(
+            conv_dim,
+            mask_dim,
+            1,
+            padding=0,
+            norm=norm,
+        )
+
+        if self.csm_shape_enabled:
+
+            # ------------------------------------------------------------
+            # B8: task-specialized dual experts
+            #
+            # boundary expert:
+            #     explicit boundary presence B
+            #
+            # shape expert:
+            #     multi-scale local geometry for B*S
+            #
+            # Losses / targets / lambda remain identical to B7.
+            # ------------------------------------------------------------
+            self.csm_boundary_head = B8BoundaryExpert(
+                conv_dim
+            )
+
+            self.csm_shape_head = B8ShapeExpert(
+                conv_dim
+            )
+
+        else:
+            self.csm_shape_head = None
+            self.csm_boundary_head = None
+
+        # if self.csm_shape_enabled:
+        #     self.csm_shape_head = nn.Sequential(
+        #         nn.Conv2d(
+        #             conv_dim,
+        #             conv_dim // 2,
+        #             kernel_size=3,
+        #             padding=1,
+        #             bias=True,
+        #         ),
+        #         nn.ReLU(inplace=True),
+        #         nn.Conv2d(
+        #             conv_dim // 2,
+        #             1,
+        #             kernel_size=1,
+        #             bias=True,
+        #         ),
+        #     )
+
+        #     # B7:
+        #     # independent boundary-presence head.
+        #     #
+        #     # Shape semantics and boundary existence are intentionally
+        #     # factorized into separate training-only heads.
+        #     self.csm_boundary_head = nn.Sequential(
+        #         nn.Conv2d(
+        #             conv_dim,
+        #             conv_dim // 2,
+        #             kernel_size=3,
+        #             padding=1,
+        #             bias=True,
+        #         ),
+        #         nn.ReLU(inplace=True),
+        #         nn.Conv2d(
+        #             conv_dim // 2,
+        #             1,
+        #             kernel_size=1,
+        #             bias=True,
+        #         ),
+        #     )
+
+        # else:
+        #     self.csm_shape_head = None
+        #     self.csm_boundary_head = None
 
     @classmethod
     def from_config(cls, cfg, input_shape: Dict[str, ShapeSpec]):
@@ -233,6 +537,7 @@ class PEM_Pixel_Decoder(nn.Module):
         ret["conv_dim"] = cfg.MODEL.SEM_SEG_HEAD.CONVS_DIM
         ret["mask_dim"] = cfg.MODEL.SEM_SEG_HEAD.MASK_DIM
         ret["norm"] = cfg.MODEL.SEM_SEG_HEAD.NORM
+        ret["csm_shape_enabled"] = cfg.MODEL.CSM_SHAPE.ENABLED
         return ret
 
     def forward_features(self, features):
@@ -251,9 +556,37 @@ class PEM_Pixel_Decoder(nn.Module):
         x_8 = self.csm[2](in_features[1]) + x_up
         x_8, x_up = self.dcn[2](x_8)
 
-        x_4 = self.csm[3](in_features[0]) + x_up
+        csm_4 = self.csm[3](in_features[0])
 
-        return self.out(x_4), None, [x_32, x_16, x_8]
+        x_4 = csm_4 + x_up
+
+        csm_shape_pred = None
+        csm_boundary_pred = None
+
+        # if self.training and self.csm_shape_enabled:
+        #     csm_shape_pred = self.csm_shape_head(
+        #         csm_4
+        #     )
+
+        #     csm_boundary_pred = self.csm_boundary_head(
+        #         csm_4
+        #     )
+        if self.training and self.csm_shape_enabled:
+            csm_shape_pred = self.csm_shape_head(
+                x_4
+            )
+
+            csm_boundary_pred = self.csm_boundary_head(
+                x_4
+            )
+
+        return (
+            self.out(x_4),
+            None,
+            [x_32, x_16, x_8],
+            csm_shape_pred,
+            csm_boundary_pred,
+        )
 
     def forward(self, features, targets=None):
         logger = logging.getLogger(__name__)

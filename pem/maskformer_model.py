@@ -12,10 +12,18 @@ from detectron2.modeling.backbone import Backbone
 from detectron2.modeling.postprocessing import sem_seg_postprocess
 from detectron2.structures import Boxes, ImageList, Instances, BitMasks
 from detectron2.utils.memory import retry_if_cuda_oom
-
+from research.shape_ssb.loss.csm_shape_loss import (
+    csm_shape_aux_loss,
+    csm_boundary_presence_loss,
+)
 from .modeling.criterion import SetCriterion
 from .modeling.matcher import HungarianMatcher
+from detectron2.utils.events import get_event_storage
 
+from research.shape_ssb.loss.ssb_loss import (
+    SSBLoss,
+    ssb_warmup_weight,
+)
 
 @META_ARCH_REGISTRY.register()
 class MaskFormer(nn.Module):
@@ -43,6 +51,17 @@ class MaskFormer(nn.Module):
         panoptic_on: bool,
         instance_on: bool,
         test_topk_per_image: int,
+        # SSB
+        ssb_enabled: bool,
+        ssb_max_weight: float,
+        ssb_warmup_start: int,
+        ssb_warmup_end: int,
+        # CSM shape supervision
+        csm_shape_enabled: bool,
+        csm_shape_max_weight: float,
+        csm_shape_warmup_start: int,
+        csm_shape_warmup_end: int,
+        csm_shape_band_kernel: int,
     ):
         """
         Args:
@@ -89,7 +108,34 @@ class MaskFormer(nn.Module):
         self.instance_on = instance_on
         self.panoptic_on = panoptic_on
         self.test_topk_per_image = test_topk_per_image
+        # ------------------------------------------------------------
+        # Shape-Sensitive Boundary auxiliary loss
+        # ------------------------------------------------------------
+        self.ssb_enabled = bool(ssb_enabled)
+        self.ssb_max_weight = float(ssb_max_weight)
+        self.ssb_warmup_start = int(ssb_warmup_start)
+        self.ssb_warmup_end = int(ssb_warmup_end)
 
+        self.ssb_loss = SSBLoss()
+        self.csm_shape_enabled = bool(
+            csm_shape_enabled
+        )
+
+        self.csm_shape_max_weight = float(
+            csm_shape_max_weight
+        )
+
+        self.csm_shape_warmup_start = int(
+            csm_shape_warmup_start
+        )
+
+        self.csm_shape_warmup_end = int(
+            csm_shape_warmup_end
+        )
+
+        self.csm_shape_band_kernel = int(
+            csm_shape_band_kernel
+        )
         if not self.semantic_on:
             assert self.sem_seg_postprocess_before_inference
 
@@ -158,6 +204,34 @@ class MaskFormer(nn.Module):
             "instance_on": cfg.MODEL.MASK_FORMER.TEST.INSTANCE_ON,
             "panoptic_on": cfg.MODEL.MASK_FORMER.TEST.PANOPTIC_ON,
             "test_topk_per_image": cfg.TEST.DETECTIONS_PER_IMAGE,
+            # ------------------------------------------------------------
+            # SSB
+            # max_weight=0.1 is TEMPORARY for integration / smoke testing.
+            # Final lambda_B will be selected in Phase 5-5.
+            # ------------------------------------------------------------
+            # "ssb_enabled": True,
+            # "ssb_max_weight": 0.1,
+            # "ssb_warmup_start": 1000,
+            # "ssb_warmup_end": 5000,
+            #short 
+            "ssb_enabled": cfg.MODEL.SSB.ENABLED,
+            "ssb_max_weight": cfg.MODEL.SSB.MAX_WEIGHT,
+            "ssb_warmup_start": cfg.MODEL.SSB.WARMUP_START,
+            "ssb_warmup_end": cfg.MODEL.SSB.WARMUP_END,
+            "csm_shape_enabled":
+                cfg.MODEL.CSM_SHAPE.ENABLED,
+
+            "csm_shape_max_weight":
+                cfg.MODEL.CSM_SHAPE.MAX_WEIGHT,
+
+            "csm_shape_warmup_start":
+                cfg.MODEL.CSM_SHAPE.WARMUP_START,
+
+            "csm_shape_warmup_end":
+                cfg.MODEL.CSM_SHAPE.WARMUP_END,
+
+            "csm_shape_band_kernel":
+                cfg.MODEL.CSM_SHAPE.BAND_KERNEL,
         }
 
     @property
@@ -208,12 +282,460 @@ class MaskFormer(nn.Module):
             # bipartite matching-based loss
             losses = self.criterion(outputs, targets)
 
+            # ------------------------------------------------------------
+            # Existing PEM losses
+            # ------------------------------------------------------------
             for k in list(losses.keys()):
                 if k in self.criterion.weight_dict:
                     losses[k] *= self.criterion.weight_dict[k]
                 else:
-                    # remove this loss if not specified in `weight_dict`
+                    # remove this loss if not specified in weight_dict
                     losses.pop(k)
+
+            # ------------------------------------------------------------
+            # Shape-Sensitive Boundary auxiliary loss
+            # ------------------------------------------------------------
+            if self.ssb_enabled:
+
+                required_ssb_keys = (
+                    "ssb_phi",
+                    "ssb_weight",
+                    "ssb_valid_classes",
+                    "ssb_valid_mask",
+                )
+
+                for key in required_ssb_keys:
+                    if key not in batched_inputs[0]:
+                        raise KeyError(
+                            f"SSB is enabled but '{key}' "
+                            "is missing from mapper output."
+                        )
+
+                # GT-side targets were generated on CPU workers.
+                # Move only the tensors needed by the differentiable GPU loss.
+                ssb_phi = torch.stack(
+                    [
+                        x["ssb_phi"]
+                        for x in batched_inputs
+                    ],
+                    dim=0,
+                ).to(
+                    device=self.device,
+                    dtype=torch.float32,
+                    non_blocking=True,
+                )
+                ssb_weight = torch.stack(
+                    [
+                        x["ssb_weight"]
+                        for x in batched_inputs
+                    ],
+                    dim=0,
+                ).to(
+                    device=self.device,
+                    dtype=torch.float32,
+                    non_blocking=True,
+                )
+                ssb_valid_classes = torch.stack(
+                    [
+                        x["ssb_valid_classes"]
+                        for x in batched_inputs
+                    ],
+                    dim=0,
+                ).to(
+                    device=self.device,
+                    dtype=torch.bool,
+                    non_blocking=True,
+                )
+
+                ssb_valid_mask = torch.stack(
+                    [
+                        x["ssb_valid_mask"]
+                        for x in batched_inputs
+                    ],
+                    dim=0,
+                ).to(
+                    device=self.device,
+                    dtype=torch.bool,
+                    non_blocking=True,
+                )
+
+                # ------------------------------------------------------------
+                # Deep SSB supervision
+                #
+                # Use:
+                #   - final decoder prediction
+                #   - last two auxiliary decoder predictions
+                #
+                # Therefore SSB is applied to the last 3 prediction stages.
+                # ------------------------------------------------------------
+
+                aux_outputs = outputs.get("aux_outputs", None)
+
+                if aux_outputs is None:
+                    raise RuntimeError(
+                        "Deep SSB requires outputs['aux_outputs'], "
+                        "but it is missing. Check DEEP_SUPERVISION."
+                    )
+
+                if len(aux_outputs) < 1:
+                    raise RuntimeError(
+                        "Deep SSB requires at least one auxiliary output, "
+                        f"but got {len(aux_outputs)}."
+                    )
+
+                ssb_stage_outputs = [
+                    aux_outputs[-1],
+                    {
+                        "pred_logits": outputs["pred_logits"],
+                        "pred_masks": outputs["pred_masks"],
+                    },
+                ]
+                ssb_stage_losses = []
+
+                for stage_output in ssb_stage_outputs:
+                    stage_loss = self.ssb_loss(
+                        pred_logits=stage_output["pred_logits"],
+                        pred_masks=stage_output["pred_masks"],
+                        phi=ssb_phi,
+                        weight=ssb_weight,
+                        valid_classes=ssb_valid_classes,
+                        valid_mask=ssb_valid_mask,
+                        # valid_mask=csm_valid_mask,
+                    )
+
+                    ssb_stage_losses.append(stage_loss)
+
+                raw_loss_ssb = torch.stack(
+                    ssb_stage_losses
+                ).mean()
+                
+                iteration = int(
+                    get_event_storage().iter
+                )
+
+                lambda_b = ssb_warmup_weight(
+                    iteration=iteration,
+                    max_weight=self.ssb_max_weight,
+                    warmup_start=self.ssb_warmup_start,
+                    warmup_end=self.ssb_warmup_end,
+                )
+
+                # Important:
+                # Add AFTER the PEM criterion weight/pop loop.
+                # losses["loss_ssb"] = (
+                #     raw_loss_ssb
+                #     * float(lambda_b)
+                # )
+                weighted_loss_ssb = (
+                    raw_loss_ssb
+                    * float(lambda_b)
+                )
+                # ---------------------------------------------------------
+                # Periodic gradient diagnostics
+                #
+                # Compare the original PEM objective against raw SSB.
+                # Diagnostic only: autograd.grad() does not populate p.grad.
+                # ---------------------------------------------------------
+                grad_diag_period = 200
+
+                if (
+                    iteration > 0
+                    and (iteration+1) % grad_diag_period == 0
+                ):
+                    # At this point `losses` contains only the weighted
+                    # original PEM criterion losses.
+                    pem_loss_for_grad = sum(
+                        losses.values()
+                    )
+
+                    grad_params = [
+                        p
+                        for p in self.parameters()
+                        if p.requires_grad
+                    ]
+
+                    grad_pem = torch.autograd.grad(
+                        pem_loss_for_grad,
+                        grad_params,
+                        retain_graph=True,
+                        allow_unused=True,
+                    )
+
+                    grad_ssb_raw = torch.autograd.grad(
+                        raw_loss_ssb,
+                        grad_params,
+                        retain_graph=True,
+                        allow_unused=True,
+                    )
+
+                    pem_sq = raw_loss_ssb.new_zeros(())
+                    ssb_sq = raw_loss_ssb.new_zeros(())
+                    dot = raw_loss_ssb.new_zeros(())
+
+                    for g_pem, g_ssb in zip(
+                        grad_pem,
+                        grad_ssb_raw,
+                    ):
+                        if g_pem is not None:
+                            pem_sq = (
+                                pem_sq
+                                + g_pem.detach().float().square().sum()
+                            )
+
+                        if g_ssb is not None:
+                            ssb_sq = (
+                                ssb_sq
+                                + g_ssb.detach().float().square().sum()
+                            )
+
+                        if (
+                            g_pem is not None
+                            and g_ssb is not None
+                        ):
+                            dot = (
+                                dot
+                                + (
+                                    g_pem.detach().float()
+                                    * g_ssb.detach().float()
+                                ).sum()
+                            )
+
+                    grad_pem_norm = torch.sqrt(
+                        pem_sq
+                    )
+
+                    grad_ssb_raw_norm = torch.sqrt(
+                        ssb_sq
+                    )
+
+                    grad_ssb_weighted_norm = (
+                        grad_ssb_raw_norm
+                        * abs(float(lambda_b))
+                    )
+
+                    denom = (
+                        grad_pem_norm
+                        * grad_ssb_raw_norm
+                    )
+
+                    if float(denom.item()) > 0.0:
+                        grad_cosine = (
+                            dot / denom
+                        )
+                    else:
+                        grad_cosine = raw_loss_ssb.new_tensor(
+                            float("nan")
+                        )
+
+                    storage = get_event_storage()
+
+                    storage.put_scalar(
+                        "grad_pem_norm",
+                        float(
+                            grad_pem_norm.item()
+                        ),
+                    )
+
+                    storage.put_scalar(
+                        "grad_ssb_raw_norm",
+                        float(
+                            grad_ssb_raw_norm.item()
+                        ),
+                    )
+
+                    storage.put_scalar(
+                        "grad_ssb_weighted_norm",
+                        float(
+                            grad_ssb_weighted_norm.item()
+                        ),
+                    )
+
+                    storage.put_scalar(
+                        "grad_pem_ssb_cosine",
+                        float(
+                            grad_cosine.item()
+                        ),
+                    )
+                losses["loss_ssb"] = weighted_loss_ssb
+
+                storage = get_event_storage()
+
+                storage.put_scalar(
+                    "loss_ssb_raw",
+                    float(
+                        raw_loss_ssb.detach().item()
+                    ),
+                )
+
+                storage.put_scalar(
+                    "lambda_ssb",
+                    float(lambda_b),
+                )
+
+                storage.put_scalar(
+                    "loss_ssb_weighted",
+                    float(
+                        weighted_loss_ssb.detach().item()
+                    ),
+                )
+            # ------------------------------------------------------------
+            # CSM feature-level shape supervision
+            # ------------------------------------------------------------
+            if self.csm_shape_enabled:
+                required_csm_keys = (
+                    "csm_shape_target",
+                    "csm_shape_weight",
+                    "csm_boundary",
+                    "ssb_valid_mask",
+                )
+                for key in required_csm_keys:
+                    if key not in batched_inputs[0]:
+                        raise KeyError(
+                            "CSM shape supervision is enabled but "
+                            f"'{key}' is missing from mapper output."
+                        )
+                if "csm_shape_pred" not in outputs:
+                    raise KeyError(
+                        "B7 CSM supervision is enabled but "
+                        "outputs['csm_shape_pred'] is missing."
+                    )
+
+                if "csm_boundary_pred" not in outputs:
+                    raise KeyError(
+                        "B7 CSM supervision is enabled but "
+                        "outputs['csm_boundary_pred'] is missing."
+                    )
+                csm_shape_target = torch.stack(
+                    [
+                        x["csm_shape_target"]
+                        for x in batched_inputs
+                    ],
+                    dim=0,
+                ).to(
+                    device=self.device,
+                    dtype=torch.float32,
+                    non_blocking=True,
+                )
+
+                csm_boundary = torch.stack(
+                    [
+                        x["csm_boundary"]
+                        for x in batched_inputs
+                    ],
+                    dim=0,
+                ).to(
+                    device=self.device,
+                    dtype=torch.bool,
+                    non_blocking=True,
+                )
+                # csm_shape_weight = torch.stack(
+                #     [
+                #         x["csm_shape_weight"]
+                #         for x in batched_inputs
+                #     ],
+                #     dim=0,
+                # ).to(self.device)
+                csm_shape_weight = torch.stack(
+                    [
+                        x["csm_shape_weight"]
+                        for x in batched_inputs
+                    ],
+                    dim=0,
+                ).to(
+                    device=self.device,
+                    dtype=torch.float32,
+                    non_blocking=True,
+                )
+
+                csm_valid_mask = torch.stack(
+                    [
+                        x["ssb_valid_mask"]
+                        for x in batched_inputs
+                    ],
+                    dim=0,
+                ).to(
+                    device=self.device,
+                    dtype=torch.bool,
+                    non_blocking=True,
+                )
+                raw_loss_csm_shape = csm_shape_aux_loss(
+                    pred_logits=outputs["csm_shape_pred"],
+                    target=csm_shape_target,
+                    boundary=csm_boundary,
+                    valid_mask=csm_valid_mask,
+                    pixel_weight=csm_shape_weight,
+                    band_kernel=self.csm_shape_band_kernel,
+                )
+                raw_loss_csm_presence = (
+                    csm_boundary_presence_loss(
+                        pred_logits=outputs[
+                            "csm_boundary_pred"
+                        ],
+                        boundary=csm_boundary,
+                        valid_mask=csm_valid_mask,
+                        band_kernel=self.csm_shape_band_kernel,
+                    )
+                )
+
+                # --------------------------------------------------
+                # B7 factorized CSM supervision
+                #
+                # presence branch:
+                #     target = B
+                #
+                # shape branch:
+                #     target = B*S
+                #     B6 one-sided loss
+                #
+                # Keep total auxiliary scale comparable to B2-B6.
+                # --------------------------------------------------
+                raw_loss_csm_factorized = (
+                    0.5 * raw_loss_csm_presence
+                    + 0.5 * raw_loss_csm_shape
+                )
+
+                iteration = int(
+                    get_event_storage().iter
+                )
+
+                lambda_c = ssb_warmup_weight(
+                    iteration=iteration,
+                    max_weight=self.csm_shape_max_weight,
+                    warmup_start=self.csm_shape_warmup_start,
+                    warmup_end=self.csm_shape_warmup_end,
+                )
+
+                losses["loss_csm_shape"] = (
+                    raw_loss_csm_factorized
+                    * float(lambda_c)
+                )
+
+                storage = get_event_storage()
+                storage.put_scalar(
+                    "loss_csm_shape_raw",
+                    float(
+                        raw_loss_csm_shape.detach()
+                    ),
+                )
+
+                storage.put_scalar(
+                    "loss_csm_presence_raw",
+                    float(
+                        raw_loss_csm_presence.detach()
+                    ),
+                )
+
+                storage.put_scalar(
+                    "loss_csm_factorized_raw",
+                    float(
+                        raw_loss_csm_factorized.detach()
+                    ),
+                )
+
+                storage.put_scalar(
+                    "lambda_csm_shape",
+                    float(lambda_c),
+                )
             return losses
         else:
             mask_cls_results = outputs["pred_logits"]

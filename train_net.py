@@ -283,6 +283,14 @@ def setup(args):
     add_maskformer2_config(cfg)
     cfg.merge_from_file(args.config_file)
     cfg.merge_from_list(args.opts)
+    
+    from datetime import datetime
+    # timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # cfg.OUTPUT_DIR = f"{cfg.OUTPUT_DIR}_{timestamp}"
+    if not args.resume:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        cfg.OUTPUT_DIR = f"{cfg.OUTPUT_DIR}_{timestamp}"
+
     cfg.freeze()
     default_setup(cfg, args)
     # Setup logger for "mask_former" module

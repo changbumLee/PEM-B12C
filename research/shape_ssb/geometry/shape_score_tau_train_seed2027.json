@@ -1,0 +1,27 @@
+{
+  "dataset": "cityscapes_fine_sem_seg_train",
+  "split": "train",
+  "num_images": 2975,
+  "num_valid_S_points": 26854899,
+  "seed": 2027,
+  "coverage": "each DatasetCatalog record exactly once",
+  "augmentation": "same PEM training mapper distribution (resize/crop/color/flip); color does not affect GT geometry",
+  "tau_rule": "Q50(valid S)",
+  "tau": 0.06408500671386719,
+  "quantiles": {
+    "q05": 2.0908024453092366e-05,
+    "q25": 0.006992947775870562,
+    "q50": 0.06408500671386719,
+    "q75": 0.21625541150569916,
+    "q95": 0.8279739022254944
+  },
+  "radii": [
+    2,
+    4,
+    8
+  ],
+  "min_contour_points": 16,
+  "ignore_label": 255,
+  "curvature_reference": "research/shape_ssb/geometry/curvature_reference_q95.json",
+  "calibration_distribution": "S computed with halo context; only finite contour points inside final center crop retained"
+}

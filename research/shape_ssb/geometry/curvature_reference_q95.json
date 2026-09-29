@@ -1,0 +1,87 @@
+{
+  "dataset": "Cityscapes",
+  "split": "train",
+  "percentile": 95.0,
+  "radii": [
+    2,
+    4,
+    8
+  ],
+  "seed": 2026,
+  "max_samples_per_scale": 2000000,
+  "min_contour_points": 16,
+  "ignore_label": 255,
+  "calibration_geometry": {
+    "resize_shortest_edge": true,
+    "min_size_train_sampling": "choice",
+    "min_size_train": [
+      512,
+      614,
+      716,
+      819,
+      921,
+      1024,
+      1126,
+      1228,
+      1331,
+      1433,
+      1536,
+      1638,
+      1740,
+      1843,
+      1945,
+      2048
+    ],
+    "max_size_train": 4096,
+    "interpolation": "nearest",
+    "crop_applied": false,
+    "flip_applied": false,
+    "note": "Resize distribution matched to PEM Cityscapes training. Crop/flip are intentionally omitted from global curvature calibration; flip preserves curvature magnitude and crop context is handled by halo geometry."
+  },
+  "resize_choice_counts": {
+    "512": 172,
+    "614": 205,
+    "716": 190,
+    "819": 181,
+    "921": 181,
+    "1024": 211,
+    "1126": 194,
+    "1228": 186,
+    "1331": 174,
+    "1433": 189,
+    "1536": 178,
+    "1638": 172,
+    "1740": 169,
+    "1843": 198,
+    "1945": 183,
+    "2048": 192
+  },
+  "resized_shape_counts": {
+    "1024x2048": 211,
+    "1126x2252": 194,
+    "1228x2456": 186,
+    "1331x2662": 174,
+    "1433x2866": 189,
+    "1536x3072": 178,
+    "1638x3276": 172,
+    "1740x3480": 169,
+    "1843x3686": 198,
+    "1945x3890": 183,
+    "2048x4096": 192,
+    "512x1024": 172,
+    "614x1228": 205,
+    "716x1432": 190,
+    "819x1638": 181,
+    "921x1842": 181
+  },
+  "references": {
+    "r2": 0.5227246880531311,
+    "r4": 0.25844115018844604,
+    "r8": 0.1801043599843979
+  },
+  "sample_counts": {
+    "r2": 2000000,
+    "r4": 2000000,
+    "r8": 2000000
+  }
+}

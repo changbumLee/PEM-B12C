@@ -1,0 +1,13 @@
+_BASE_: ../pem_r50_1gpu_baseline.yaml
+
+MODEL:
+  SSB:
+    ENABLED: True
+    MAX_WEIGHT: 0.20
+    WARMUP_START: 1000
+    WARMUP_END: 5000
+
+SOLVER:
+  MAX_ITER: 6000
+
+OUTPUT_DIR: output/kroc_curve/ssb_lambda/l020_6k
