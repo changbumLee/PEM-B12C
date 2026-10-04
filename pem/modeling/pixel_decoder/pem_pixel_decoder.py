@@ -7,7 +7,9 @@ from typing import Callable, Dict, Optional, Union
 import fvcore.nn.weight_init as weight_init
 import torch
 from torch import nn
+import torch.nn.functional as F
 
+from detectron2.utils.events import get_event_storage
 from detectron2.config import configurable
 from detectron2.layers import Conv2d, DeformConv, ShapeSpec, get_norm
 from detectron2.modeling import SEM_SEG_HEADS_REGISTRY
@@ -417,6 +419,321 @@ class B8ShapeExpert(nn.Module):
         )
 
         return self.out(feat)
+class B12SCDA(nn.Module):
+    """
+    B12 Shape-Critical Dynamic Alignment.
+
+    Align the final coarse stride-8 -> stride-4 feature
+    before the final PEM fusion.
+
+    The residual formulation guarantees exact B10 behavior
+    when the predicted offset is zero:
+
+        fine + coarse
+        + gate * (aligned_coarse - coarse)
+
+    Offset is zero-initialized.
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        max_offset: float = 1.0,
+    ):
+        super().__init__()
+
+        hidden = channels // 2
+        num_groups = (
+            8 if hidden % 8 == 0 else 1
+        )
+
+        self.max_offset = float(max_offset)
+
+        self.context = nn.Sequential(
+            nn.Conv2d(
+                channels * 2,
+                hidden,
+                kernel_size=3,
+                padding=1,
+                bias=False,
+            ),
+            nn.GroupNorm(
+                num_groups,
+                hidden,
+            ),
+            nn.GELU(),
+
+            nn.Conv2d(
+                hidden,
+                hidden,
+                kernel_size=3,
+                padding=1,
+                bias=False,
+            ),
+            nn.GroupNorm(
+                num_groups,
+                hidden,
+            ),
+            nn.GELU(),
+        )
+
+        # 2-D sampling displacement:
+        # channel 0 = dx
+        # channel 1 = dy
+        self.offset_head = nn.Conv2d(
+            hidden,
+            2,
+            kernel_size=1,
+            bias=True,
+        )
+
+        # Spatial gate deciding how much aligned
+        # coarse feature replaces the original one.
+        self.gate_head = nn.Conv2d(
+            hidden,
+            1,
+            kernel_size=1,
+            bias=True,
+        )
+
+        # --------------------------------------------------
+        # Important initialization:
+        #
+        # offset == 0
+        # => aligned_coarse == coarse
+        # => SCDA output == original B10 fusion
+        # --------------------------------------------------
+        nn.init.zeros_(
+            self.offset_head.weight
+        )
+        nn.init.zeros_(
+            self.offset_head.bias
+        )
+
+        # gate starts at 0.5.
+        # Since offset starts at zero, this still gives
+        # exactly the original B10 feature.
+        nn.init.zeros_(
+            self.gate_head.weight
+        )
+        nn.init.zeros_(
+            self.gate_head.bias
+        )
+
+    def _make_base_grid(
+        self,
+        batch_size,
+        height,
+        width,
+        device,
+        dtype,
+    ):
+        ys = torch.linspace(
+            -1.0,
+            1.0,
+            height,
+            device=device,
+            dtype=dtype,
+        )
+
+        xs = torch.linspace(
+            -1.0,
+            1.0,
+            width,
+            device=device,
+            dtype=dtype,
+        )
+
+        grid_y, grid_x = torch.meshgrid(
+            ys,
+            xs,
+            indexing="ij",
+        )
+
+        grid = torch.stack(
+            [
+                grid_x,
+                grid_y,
+            ],
+            dim=-1,
+        )
+
+        grid = grid.unsqueeze(0).expand(
+            batch_size,
+            -1,
+            -1,
+            -1,
+        )
+
+        return grid
+
+    def forward(
+        self,
+        fine_feat,
+        coarse_up,
+    ):
+        """
+        fine_feat:
+            stride-4 local CSM feature
+
+        coarse_up:
+            stride-8 feature already upsampled
+            to stride-4 by the original PEM DeformLayer
+        """
+
+        if (
+            fine_feat.shape[-2:]
+            != coarse_up.shape[-2:]
+        ):
+            raise RuntimeError(
+                "B12SCDA expects fine_feat and "
+                "coarse_up to have identical spatial size, "
+                f"got {fine_feat.shape[-2:]} and "
+                f"{coarse_up.shape[-2:]}"
+            )
+
+        context = torch.cat(
+            [
+                fine_feat,
+                coarse_up,
+            ],
+            dim=1,
+        )
+
+        context = self.context(
+            context
+        )
+
+        # Offset in stride-4 feature-pixel units.
+        offset = (
+            torch.tanh(
+                self.offset_head(
+                    context
+                )
+            )
+            * self.max_offset
+        )
+
+        gate = torch.sigmoid(
+            self.gate_head(
+                context
+            )
+        )
+
+        batch_size, _, height, width = (
+            coarse_up.shape
+        )
+
+        base_grid = self._make_base_grid(
+            batch_size,
+            height,
+            width,
+            coarse_up.device,
+            coarse_up.dtype,
+        )
+
+        # Convert feature-pixel displacement
+        # to normalized grid_sample coordinates.
+        if width > 1:
+            offset_x = (
+                offset[:, 0]
+                * (2.0 / (width - 1))
+            )
+        else:
+            offset_x = (
+                offset[:, 0] * 0.0
+            )
+
+        if height > 1:
+            offset_y = (
+                offset[:, 1]
+                * (2.0 / (height - 1))
+            )
+        else:
+            offset_y = (
+                offset[:, 1] * 0.0
+            )
+
+        offset_grid = torch.stack(
+            [
+                offset_x,
+                offset_y,
+            ],
+            dim=-1,
+        )
+
+        sample_grid = (
+            base_grid
+            + offset_grid
+        )
+
+        aligned_coarse = F.grid_sample(
+            coarse_up,
+            sample_grid,
+            mode="bilinear",
+            padding_mode="border",
+            align_corners=True,
+        )
+
+        # --------------------------------------------------
+        # Residual replacement.
+        #
+        # offset == 0:
+        # aligned_coarse == coarse_up
+        #
+        # therefore:
+        # fused == fine_feat + coarse_up
+        #
+        # exactly reproducing B10.
+        # --------------------------------------------------
+        alignment_residual = (
+            aligned_coarse
+            - coarse_up
+        )
+
+        fused = (
+            fine_feat
+            + coarse_up
+            + gate * alignment_residual
+        )
+
+        if self.training:
+            storage = get_event_storage()
+
+            storage.put_scalar(
+                "scda_gate_mean",
+                float(
+                    gate.detach()
+                    .mean()
+                    .cpu()
+                ),
+            )
+
+            storage.put_scalar(
+                "scda_offset_abs_mean",
+                float(
+                    offset.detach()
+                    .abs()
+                    .mean()
+                    .cpu()
+                ),
+            )
+
+            storage.put_scalar(
+                "scda_offset_abs_max",
+                float(
+                    offset.detach()
+                    .abs()
+                    .max()
+                    .cpu()
+                ),
+            )
+
+        return (
+            fused,
+            gate,
+            offset,
+        )
 @SEM_SEG_HEADS_REGISTRY.register()
 class PEM_Pixel_Decoder(nn.Module):
     @configurable
@@ -450,6 +767,15 @@ class PEM_Pixel_Decoder(nn.Module):
         self.csm = nn.ModuleList([CSM(conv_dim, factor=2, norm=norm) for _ in range(4)])
         self.dcn = nn.ModuleList([DeformLayer(conv_dim, conv_dim, norm=norm) for _ in range(3)])
         self.csm_shape_enabled = bool(csm_shape_enabled)
+        # B12-SCDA:
+        # final stride-8 -> stride-4 dynamic alignment.
+        #
+        # This is part of the main inference path,
+        # unlike the B10 training-only auxiliary experts.
+        self.scda = B12SCDA(
+            conv_dim,
+            max_offset=1.0,
+        )
 
         self.out = ConvBNReLU(
             conv_dim,
@@ -558,8 +884,10 @@ class PEM_Pixel_Decoder(nn.Module):
 
         csm_4 = self.csm[3](in_features[0])
 
-        x_4 = csm_4 + x_up
-
+        x_4, scda_gate, scda_offset = self.scda(
+            csm_4,
+            x_up,
+        )
         csm_shape_pred = None
         csm_boundary_pred = None
 
