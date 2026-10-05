@@ -109,8 +109,11 @@ class MaskFormerHead(nn.Module):
             multi_scale_features,
             csm_shape_pred,
             csm_boundary_pred,
-        ) = self.pixel_decoder.forward_features(features)
-
+            scda_base_feature,
+            scda_correction,
+        ) = self.pixel_decoder.forward_features(
+            features
+        )
         predictions = self.predictor(
             multi_scale_features,
             mask_features,
@@ -124,5 +127,11 @@ class MaskFormerHead(nn.Module):
             predictions["csm_boundary_pred"] = (
                 csm_boundary_pred
             )
+
+        if scda_base_feature is not None:
+            predictions["scda_base_feature"] = scda_base_feature
+
+        if scda_correction is not None:
+            predictions["scda_correction"] = scda_correction
 
         return predictions

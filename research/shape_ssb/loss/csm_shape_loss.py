@@ -644,3 +644,268 @@ def csm_boundary_presence_loss(
     )
 
     return numerator / denominator
+
+def scda_semantic_prototype_preservation_loss(
+    base_feature,
+    correction,
+    semantic_gt,
+    boundary,
+    valid_mask,
+    num_classes=19,
+    band_kernel=9,
+    min_cells=16,
+    eps=1e-6,
+):
+    """
+    B12-b:
+    Class-balanced semantic prototype preservation
+    for SCDA.
+
+    base_feature:
+        [B,C,h,w]
+        Detached pre-SCDA fusion:
+            F_base = F_fine + F_coarse
+
+    correction:
+        [B,C,h,w]
+        Actual SCDA correction:
+            C = G * (F_align - F_coarse)
+
+    semantic_gt:
+        [B,H,W]
+        Semantic class labels.
+
+    boundary:
+        [B,1,H,W]
+        GT semantic contour.
+
+    valid_mask:
+        [B,H,W] or [B,1,H,W]
+
+    The loss acts only on class-interior regions.
+
+    Boundary neighborhood:
+        completely unconstrained.
+
+    Reference branch:
+        stop-gradient.
+
+    Each semantic class contributes equally,
+    which is desirable for class-balanced semantic
+    preservation rather than pixel-frequency weighting.
+    """
+
+    if base_feature.ndim != 4:
+        raise ValueError(
+            "base_feature must be [B,C,h,w], "
+            f"got {tuple(base_feature.shape)}"
+        )
+
+    if correction.shape != base_feature.shape:
+        raise ValueError(
+            "correction/base_feature shape mismatch: "
+            f"{tuple(correction.shape)} vs "
+            f"{tuple(base_feature.shape)}"
+        )
+
+    if semantic_gt.ndim == 4:
+        if semantic_gt.shape[1] != 1:
+            raise ValueError(
+                "4D semantic_gt must have one channel"
+            )
+        semantic_gt = semantic_gt[:, 0]
+
+    if semantic_gt.ndim != 3:
+        raise ValueError(
+            "semantic_gt must be [B,H,W], "
+            f"got {tuple(semantic_gt.shape)}"
+        )
+
+    if boundary.ndim != 4 or boundary.shape[1] != 1:
+        raise ValueError(
+            "boundary must be [B,1,H,W], "
+            f"got {tuple(boundary.shape)}"
+        )
+
+    if valid_mask.ndim == 3:
+        valid_mask = valid_mask.unsqueeze(1)
+
+    if valid_mask.ndim != 4 or valid_mask.shape[1] != 1:
+        raise ValueError(
+            "valid_mask must be [B,H,W] or [B,1,H,W], "
+            f"got {tuple(valid_mask.shape)}"
+        )
+
+    if band_kernel < 1 or band_kernel % 2 == 0:
+        raise ValueError(
+            "band_kernel must be a positive odd integer, "
+            f"got {band_kernel}"
+        )
+
+    device = correction.device
+
+    # --------------------------------------------------
+    # Reference representation.
+    #
+    # Do not allow the preservation objective to directly
+    # move the original B12 base feature.
+    # --------------------------------------------------
+    base_ref = (
+        base_feature
+        .detach()
+        .float()
+    )
+
+    correction_fp32 = (
+        correction.float()
+    )
+
+    # Numerically equal to actual fused feature,
+    # but gradients flow only through correction.
+    aligned_proxy = (
+        base_ref
+        + correction_fp32
+    )
+
+    semantic_gt = semantic_gt.to(
+        device=device,
+        dtype=torch.long,
+    )
+
+    boundary_full = boundary.to(
+        device=device,
+        dtype=torch.float32,
+    )
+
+    valid_full = valid_mask.to(
+        device=device,
+        dtype=torch.bool,
+    )
+
+    # --------------------------------------------------
+    # Exclude boundary neighborhood.
+    # SCDA remains free to modify geometry there.
+    # --------------------------------------------------
+    pad = band_kernel // 2
+
+    boundary_band_full = F.max_pool2d(
+        boundary_full,
+        kernel_size=band_kernel,
+        stride=1,
+        padding=pad,
+    ) > 0.0
+
+    out_size = correction.shape[-2:]
+
+    boundary_band_low = (
+        F.adaptive_max_pool2d(
+            boundary_band_full.float(),
+            output_size=out_size,
+        )
+        > 0.0
+    )
+
+    invalid_full = (
+        ~valid_full
+    ).float()
+
+    invalid_low = F.adaptive_max_pool2d(
+        invalid_full,
+        output_size=out_size,
+    )
+
+    valid_low = (
+        invalid_low <= 0.0
+    )
+
+    interior_valid = (
+        valid_low
+        & (~boundary_band_low)
+    )
+
+    class_losses = []
+
+    # --------------------------------------------------
+    # One prototype per semantic class over the batch.
+    #
+    # A low-resolution cell is used only when essentially
+    # all full-resolution pixels contributing to that cell
+    # belong to the same semantic class.
+    # --------------------------------------------------
+    for class_id in range(
+        int(num_classes)
+    ):
+
+        class_full = (
+            semantic_gt
+            == class_id
+        ).float().unsqueeze(1)
+
+        class_occupancy = F.adaptive_avg_pool2d(
+            class_full,
+            output_size=out_size,
+        )
+
+        class_low = (
+            (class_occupancy > 0.999)
+            & interior_valid
+        )
+
+        num_cells = class_low.sum()
+
+        if int(
+            num_cells.detach().item()
+        ) < int(min_cells):
+            continue
+
+        weight = class_low.to(
+            dtype=torch.float32
+        )
+
+        denom = (
+            weight.sum()
+            + float(eps)
+        )
+
+        # [C]
+        prototype_base = (
+            base_ref
+            * weight
+        ).sum(
+            dim=(0, 2, 3)
+        ) / denom
+
+        # [C]
+        prototype_aligned = (
+            aligned_proxy
+            * weight
+        ).sum(
+            dim=(0, 2, 3)
+        ) / denom
+
+        # Directional semantic preservation.
+        cosine = F.cosine_similarity(
+            prototype_aligned.unsqueeze(0),
+            prototype_base.unsqueeze(0),
+            dim=1,
+            eps=float(eps),
+        )[0]
+
+        class_loss = (
+            1.0
+            - cosine
+        )
+
+        class_losses.append(
+            class_loss
+        )
+
+    if len(class_losses) == 0:
+        return (
+            correction.sum()
+            * 0.0
+        )
+
+    return torch.stack(
+        class_losses
+    ).mean()

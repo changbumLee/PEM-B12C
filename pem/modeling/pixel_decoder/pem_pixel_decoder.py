@@ -686,15 +686,41 @@ class B12SCDA(nn.Module):
         #
         # exactly reproducing B10.
         # --------------------------------------------------
+        # alignment_residual = (
+        #     aligned_coarse
+        #     - coarse_up
+        # )
+
+        # fused = (
+        #     fine_feat
+        #     + coarse_up
+        #     + gate * alignment_residual
+        # )
         alignment_residual = (
-            aligned_coarse
+        aligned_coarse
             - coarse_up
         )
 
-        fused = (
+        # --------------------------------------------------
+        # B12-b:
+        # Explicit base feature and actual SCDA correction.
+        #
+        # Forward computation is mathematically identical
+        # to B12-Core.
+        # --------------------------------------------------
+        base_feature = (
             fine_feat
             + coarse_up
-            + gate * alignment_residual
+        )
+
+        correction = (
+            gate
+            * alignment_residual
+        )
+
+        fused = (
+            base_feature
+            + correction
         )
 
         if self.training:
@@ -728,11 +754,12 @@ class B12SCDA(nn.Module):
                     .cpu()
                 ),
             )
-
         return (
             fused,
             gate,
             offset,
+            base_feature.detach(),
+            correction,
         )
 @SEM_SEG_HEADS_REGISTRY.register()
 class PEM_Pixel_Decoder(nn.Module):
@@ -884,7 +911,7 @@ class PEM_Pixel_Decoder(nn.Module):
 
         csm_4 = self.csm[3](in_features[0])
 
-        x_4, scda_gate, scda_offset = self.scda(
+        x_4, scda_gate, scda_offset ,  scda_base_feature, scda_correction = self.scda(
             csm_4,
             x_up,
         )
@@ -914,6 +941,16 @@ class PEM_Pixel_Decoder(nn.Module):
             [x_32, x_16, x_8],
             csm_shape_pred,
             csm_boundary_pred,
+            (
+                scda_base_feature
+                if self.training
+                else None
+            ),
+            (
+                scda_correction
+                if self.training
+                else None
+            ),
         )
 
     def forward(self, features, targets=None):

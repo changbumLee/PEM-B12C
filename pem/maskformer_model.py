@@ -15,6 +15,7 @@ from detectron2.utils.memory import retry_if_cuda_oom
 from research.shape_ssb.loss.csm_shape_loss import (
     csm_shape_aux_loss,
     csm_boundary_presence_loss,
+    scda_semantic_prototype_preservation_loss,
 )
 from .modeling.criterion import SetCriterion
 from .modeling.matcher import HungarianMatcher
@@ -62,6 +63,9 @@ class MaskFormer(nn.Module):
         csm_shape_warmup_start: int,
         csm_shape_warmup_end: int,
         csm_shape_band_kernel: int,
+        scda_semantic_preserve_enabled: bool,
+        scda_semantic_preserve_max_weight: float,
+        scda_semantic_preserve_min_cells: int,
     ):
         """
         Args:
@@ -136,6 +140,32 @@ class MaskFormer(nn.Module):
         self.csm_shape_band_kernel = int(
             csm_shape_band_kernel
         )
+        self.scda_semantic_preserve_enabled = bool(
+            scda_semantic_preserve_enabled
+        )
+
+        self.scda_semantic_preserve_max_weight = float(
+            scda_semantic_preserve_max_weight
+        )
+
+        self.scda_semantic_preserve_min_cells = int(
+            scda_semantic_preserve_min_cells
+        )
+
+        if (
+            self.scda_semantic_preserve_enabled
+            and not self.csm_shape_enabled
+        ):
+            raise ValueError(
+                "B12-b semantic prototype preservation "
+                "requires MODEL.CSM_SHAPE.ENABLED=True"
+            )
+
+        if self.scda_semantic_preserve_min_cells < 1:
+            raise ValueError(
+                "SCDA semantic preserve MIN_CELLS "
+                "must be >= 1"
+            )
         if not self.semantic_on:
             assert self.sem_seg_postprocess_before_inference
 
@@ -232,6 +262,14 @@ class MaskFormer(nn.Module):
 
             "csm_shape_band_kernel":
                 cfg.MODEL.CSM_SHAPE.BAND_KERNEL,
+            "scda_semantic_preserve_enabled":
+                cfg.MODEL.CSM_SHAPE.SCDA_SEMANTIC_PRESERVE_ENABLED,
+
+            "scda_semantic_preserve_max_weight":
+                cfg.MODEL.CSM_SHAPE.SCDA_SEMANTIC_PRESERVE_MAX_WEIGHT,
+
+            "scda_semantic_preserve_min_cells":
+                cfg.MODEL.CSM_SHAPE.SCDA_SEMANTIC_PRESERVE_MIN_CELLS,
         }
 
     @property
@@ -709,6 +747,115 @@ class MaskFormer(nn.Module):
                     raw_loss_csm_factorized
                     * float(lambda_c)
                 )
+                # --------------------------------------------------
+                # B12-b:
+                # Semantic prototype preservation for SCDA.
+                #
+                # Preserve class-interior semantic representation
+                # without suppressing boundary-region correction.
+                # --------------------------------------------------
+                if self.scda_semantic_preserve_enabled:
+
+                    if "scda_base_feature" not in outputs:
+                        raise KeyError(
+                            "B12-b is enabled but "
+                            "outputs['scda_base_feature'] is missing."
+                        )
+
+                    if "scda_correction" not in outputs:
+                        raise KeyError(
+                            "B12-b is enabled but "
+                            "outputs['scda_correction'] is missing."
+                        )
+
+                    if "sem_seg" not in batched_inputs[0]:
+                        raise KeyError(
+                            "B12-b requires batched_inputs['sem_seg']."
+                        )
+
+                    semantic_gt = torch.stack(
+                        [
+                            x["sem_seg"]
+                            for x in batched_inputs
+                        ],
+                        dim=0,
+                    ).to(
+                        device=self.device,
+                        dtype=torch.long,
+                        non_blocking=True,
+                    )
+
+                    raw_loss_scda_semantic = (
+                        scda_semantic_prototype_preservation_loss(
+                            base_feature=outputs[
+                                "scda_base_feature"
+                            ],
+                            correction=outputs[
+                                "scda_correction"
+                            ],
+                            semantic_gt=semantic_gt,
+                            boundary=csm_boundary,
+                            valid_mask=csm_valid_mask,
+                            num_classes=self.sem_seg_head.num_classes,
+                            band_kernel=self.csm_shape_band_kernel,
+                            min_cells=(
+                                self.scda_semantic_preserve_min_cells
+                            ),
+                        )
+                    )
+
+                    lambda_scda_semantic = ssb_warmup_weight(
+                        iteration=iteration,
+                        max_weight=(
+                            self.scda_semantic_preserve_max_weight
+                        ),
+                        warmup_start=(
+                            self.csm_shape_warmup_start
+                        ),
+                        warmup_end=(
+                            self.csm_shape_warmup_end
+                        ),
+                    )
+
+                    weighted_loss_scda_semantic = (
+                        raw_loss_scda_semantic
+                        * float(
+                            lambda_scda_semantic
+                        )
+                    )
+
+                    losses[
+                        "loss_scda_semantic"
+                    ] = (
+                        weighted_loss_scda_semantic
+                    )
+
+                    storage = get_event_storage()
+
+                    storage.put_scalar(
+                        "loss_scda_semantic_raw",
+                        float(
+                            raw_loss_scda_semantic
+                            .detach()
+                            .item()
+                        ),
+                    )
+
+                    storage.put_scalar(
+                        "lambda_scda_semantic",
+                        float(
+                            lambda_scda_semantic
+                        ),
+                    )
+
+                    storage.put_scalar(
+                        "loss_scda_semantic_weighted",
+                        float(
+                            weighted_loss_scda_semantic
+                            .detach()
+                            .item()
+                        ),
+                    )
 
                 storage = get_event_storage()
                 storage.put_scalar(
