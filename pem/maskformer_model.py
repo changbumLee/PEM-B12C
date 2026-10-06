@@ -16,6 +16,7 @@ from research.shape_ssb.loss.csm_shape_loss import (
     csm_shape_aux_loss,
     csm_boundary_presence_loss,
     scda_semantic_prototype_preservation_loss,
+    scda_relational_semantic_geometry_loss,#version12-c
 )
 from .modeling.criterion import SetCriterion
 from .modeling.matcher import HungarianMatcher
@@ -66,6 +67,8 @@ class MaskFormer(nn.Module):
         scda_semantic_preserve_enabled: bool,
         scda_semantic_preserve_max_weight: float,
         scda_semantic_preserve_min_cells: int,
+        scda_relational_enabled: bool,#version12-c
+        scda_relational_max_weight: float,#version12-c
     ):
         """
         Args:
@@ -151,6 +154,32 @@ class MaskFormer(nn.Module):
         self.scda_semantic_preserve_min_cells = int(
             scda_semantic_preserve_min_cells
         )
+
+        #version12-c
+        self.scda_relational_enabled = bool(
+            scda_relational_enabled
+        )
+
+        self.scda_relational_max_weight = float(
+            scda_relational_max_weight
+        )
+
+        if (
+            self.scda_relational_enabled
+            and not self.scda_semantic_preserve_enabled
+        ):
+            raise ValueError(
+                "B12-c relational semantic preservation "
+                "requires B12-b semantic prototype "
+                "preservation to be enabled."
+            )
+
+        if self.scda_relational_max_weight < 0.0:
+            raise ValueError(
+                "SCDA_RELATIONAL_MAX_WEIGHT "
+                "must be >= 0."
+            )
+        #version12-c
 
         if (
             self.scda_semantic_preserve_enabled
@@ -270,6 +299,14 @@ class MaskFormer(nn.Module):
 
             "scda_semantic_preserve_min_cells":
                 cfg.MODEL.CSM_SHAPE.SCDA_SEMANTIC_PRESERVE_MIN_CELLS,
+
+                    #version12-c
+            "scda_relational_enabled":
+                cfg.MODEL.CSM_SHAPE.SCDA_RELATIONAL_ENABLED,
+
+            "scda_relational_max_weight":
+                cfg.MODEL.CSM_SHAPE.SCDA_RELATIONAL_MAX_WEIGHT,
+                            #version12-c
         }
 
     @property
@@ -856,7 +893,110 @@ class MaskFormer(nn.Module):
                             .item()
                         ),
                     )
+            # B12-c:
+            # Inter-class relational semantic preservation.
+            #
+            # B12-b:
+            #   preserve individual class prototypes.
+            #
+            # B12-c:
+            #   additionally preserve pairwise semantic geometry.
+            # --------------------------------------------------
+                if self.scda_relational_enabled:
 
+                    if not self.scda_semantic_preserve_enabled:
+                        raise RuntimeError(
+                            "B12-c relational loss requires "
+                            "B12-b prototype preservation."
+                        )
+
+                    raw_loss_scda_relation, (
+                        relation_num_classes
+                    ), (
+                        relation_num_pairs
+                    ) = scda_relational_semantic_geometry_loss(
+                        base_feature=outputs[
+                            "scda_base_feature"
+                        ],
+                        correction=outputs[
+                            "scda_correction"
+                        ],
+                        semantic_gt=semantic_gt,
+                        boundary=csm_boundary,
+                        valid_mask=csm_valid_mask,
+                        num_classes=self.sem_seg_head.num_classes,
+                        band_kernel=self.csm_shape_band_kernel,
+                        min_cells=(
+                            self.scda_semantic_preserve_min_cells
+                        ),
+                    )
+
+                    lambda_scda_relation = ssb_warmup_weight(
+                        iteration=iteration,
+                        max_weight=(
+                            self.scda_relational_max_weight
+                        ),
+                        warmup_start=(
+                            self.csm_shape_warmup_start
+                        ),
+                        warmup_end=(
+                            self.csm_shape_warmup_end
+                        ),
+                    )
+
+                    weighted_loss_scda_relation = (
+                        raw_loss_scda_relation
+                        * float(
+                            lambda_scda_relation
+                        )
+                    )
+
+                    losses[
+                        "loss_scda_relation"
+                    ] = (
+                        weighted_loss_scda_relation
+                    )
+
+                    storage = get_event_storage()
+
+                    storage.put_scalar(
+                        "loss_scda_relation_raw",
+                        float(
+                            raw_loss_scda_relation
+                            .detach()
+                            .item()
+                        ),
+                    )
+
+                    storage.put_scalar(
+                        "lambda_scda_relation",
+                        float(
+                            lambda_scda_relation
+                        ),
+                    )
+
+                    storage.put_scalar(
+                        "loss_scda_relation_weighted",
+                        float(
+                            weighted_loss_scda_relation
+                            .detach()
+                            .item()
+                        ),
+                    )
+
+                    storage.put_scalar(
+                        "scda_relation_num_classes",
+                        float(
+                            relation_num_classes
+                        ),
+                    )
+
+                    storage.put_scalar(
+                        "scda_relation_num_pairs",
+                        float(
+                            relation_num_pairs
+                        ),
+                    )
                 storage = get_event_storage()
                 storage.put_scalar(
                     "loss_csm_shape_raw",

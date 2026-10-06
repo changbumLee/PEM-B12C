@@ -909,3 +909,318 @@ def scda_semantic_prototype_preservation_loss(
     return torch.stack(
         class_losses
     ).mean()
+
+def scda_relational_semantic_geometry_loss(
+    base_feature,
+    correction,
+    semantic_gt,
+    boundary,
+    valid_mask,
+    num_classes=19,
+    band_kernel=9,
+    min_cells=16,
+    eps=1e-6,
+):
+    """
+    B12-c:
+    Preserve inter-class semantic geometry under SCDA.
+
+    B12-b preserves each class prototype individually.
+    B12-c additionally preserves pairwise cosine relationships
+    between semantic class prototypes.
+
+    Boundary neighborhoods remain unconstrained.
+
+    Returns:
+        loss_relation:
+            scalar tensor
+
+        num_valid_classes:
+            number of class prototypes used
+
+        num_valid_pairs:
+            number of unique class pairs used
+    """
+
+    if base_feature.ndim != 4:
+        raise ValueError(
+            "base_feature must be [B,C,h,w], "
+            f"got {tuple(base_feature.shape)}"
+        )
+
+    if correction.shape != base_feature.shape:
+        raise ValueError(
+            "correction/base_feature shape mismatch: "
+            f"{tuple(correction.shape)} vs "
+            f"{tuple(base_feature.shape)}"
+        )
+
+    if semantic_gt.ndim == 4:
+        if semantic_gt.shape[1] != 1:
+            raise ValueError(
+                "4D semantic_gt must have one channel"
+            )
+        semantic_gt = semantic_gt[:, 0]
+
+    if semantic_gt.ndim != 3:
+        raise ValueError(
+            "semantic_gt must be [B,H,W], "
+            f"got {tuple(semantic_gt.shape)}"
+        )
+
+    if boundary.ndim != 4 or boundary.shape[1] != 1:
+        raise ValueError(
+            "boundary must be [B,1,H,W], "
+            f"got {tuple(boundary.shape)}"
+        )
+
+    if valid_mask.ndim == 3:
+        valid_mask = valid_mask.unsqueeze(1)
+
+    if (
+        valid_mask.ndim != 4
+        or valid_mask.shape[1] != 1
+    ):
+        raise ValueError(
+            "valid_mask must be [B,H,W] "
+            "or [B,1,H,W], "
+            f"got {tuple(valid_mask.shape)}"
+        )
+
+    if band_kernel < 1 or band_kernel % 2 == 0:
+        raise ValueError(
+            "band_kernel must be positive odd, "
+            f"got {band_kernel}"
+        )
+
+    device = correction.device
+
+    # --------------------------------------------------
+    # Stop-gradient semantic reference.
+    # Relation loss must only regulate SCDA correction.
+    # --------------------------------------------------
+    base_ref = (
+        base_feature
+        .detach()
+        .float()
+    )
+
+    correction_fp32 = correction.float()
+
+    aligned_proxy = (
+        base_ref
+        + correction_fp32
+    )
+
+    semantic_gt = semantic_gt.to(
+        device=device,
+        dtype=torch.long,
+    )
+
+    boundary_full = boundary.to(
+        device=device,
+        dtype=torch.float32,
+    )
+
+    valid_full = valid_mask.to(
+        device=device,
+        dtype=torch.bool,
+    )
+
+    # --------------------------------------------------
+    # Exclude boundary neighborhood.
+    #
+    # Geometry-changing SCDA remains free near boundaries.
+    # --------------------------------------------------
+    pad = band_kernel // 2
+
+    boundary_band_full = (
+        F.max_pool2d(
+            boundary_full,
+            kernel_size=band_kernel,
+            stride=1,
+            padding=pad,
+        )
+        > 0.0
+    )
+
+    out_size = correction.shape[-2:]
+
+    boundary_band_low = (
+        F.adaptive_max_pool2d(
+            boundary_band_full.float(),
+            output_size=out_size,
+        )
+        > 0.0
+    )
+
+    invalid_full = (
+        ~valid_full
+    ).float()
+
+    invalid_low = F.adaptive_max_pool2d(
+        invalid_full,
+        output_size=out_size,
+    )
+
+    valid_low = (
+        invalid_low <= 0.0
+    )
+
+    interior_valid = (
+        valid_low
+        & (~boundary_band_low)
+    )
+
+    prototype_base_list = []
+    prototype_aligned_list = []
+
+    # --------------------------------------------------
+    # Extract the same kind of class-interior prototypes
+    # used by B12-b.
+    # --------------------------------------------------
+    for class_id in range(
+        int(num_classes)
+    ):
+
+        class_full = (
+            semantic_gt == class_id
+        ).float().unsqueeze(1)
+
+        class_occupancy = (
+            F.adaptive_avg_pool2d(
+                class_full,
+                output_size=out_size,
+            )
+        )
+
+        # Conservative pure-class cells only.
+        class_low = (
+            (class_occupancy > 0.999)
+            & interior_valid
+        )
+
+        num_cells = class_low.sum()
+
+        if int(
+            num_cells.detach().item()
+        ) < int(min_cells):
+            continue
+
+        weight = class_low.float()
+
+        denom = (
+            weight.sum()
+            + float(eps)
+        )
+
+        prototype_base = (
+            base_ref
+            * weight
+        ).sum(
+            dim=(0, 2, 3)
+        ) / denom
+
+        prototype_aligned = (
+            aligned_proxy
+            * weight
+        ).sum(
+            dim=(0, 2, 3)
+        ) / denom
+
+        prototype_base_list.append(
+            prototype_base
+        )
+
+        prototype_aligned_list.append(
+            prototype_aligned
+        )
+
+    num_valid_classes = len(
+        prototype_base_list
+    )
+
+    if num_valid_classes < 2:
+        zero = (
+            correction.sum()
+            * 0.0
+        )
+
+        return (
+            zero,
+            num_valid_classes,
+            0,
+        )
+
+    prototype_base = torch.stack(
+        prototype_base_list,
+        dim=0,
+    )
+
+    prototype_aligned = torch.stack(
+        prototype_aligned_list,
+        dim=0,
+    )
+
+    # --------------------------------------------------
+    # Normalize prototypes.
+    # --------------------------------------------------
+    prototype_base = F.normalize(
+        prototype_base.detach(),
+        p=2,
+        dim=1,
+        eps=float(eps),
+    )
+
+    prototype_aligned = F.normalize(
+        prototype_aligned,
+        p=2,
+        dim=1,
+        eps=float(eps),
+    )
+
+    # --------------------------------------------------
+    # Pairwise semantic geometry.
+    #
+    # R_ij = cosine(z_i, z_j)
+    # --------------------------------------------------
+    relation_base = (
+        prototype_base
+        @ prototype_base.transpose(0, 1)
+    )
+
+    relation_aligned = (
+        prototype_aligned
+        @ prototype_aligned.transpose(0, 1)
+    )
+
+    k = relation_base.shape[0]
+
+    # Unique off-diagonal pairs only.
+    pair_mask = torch.triu(
+        torch.ones(
+            (k, k),
+            dtype=torch.bool,
+            device=device,
+        ),
+        diagonal=1,
+    )
+
+    relation_diff = (
+        relation_aligned[pair_mask]
+        - relation_base[pair_mask]
+    )
+
+    loss_relation = (
+        relation_diff.abs().mean()
+    )
+
+    num_valid_pairs = (
+        k * (k - 1) // 2
+    )
+
+    return (
+        loss_relation,
+        num_valid_classes,
+        num_valid_pairs,
+    )

@@ -126,3 +126,7 @@ def add_maskformer2_config(cfg):
     cfg.MODEL.CSM_SHAPE.SCDA_SEMANTIC_PRESERVE_MAX_WEIGHT = 0.05
 
     cfg.MODEL.CSM_SHAPE.SCDA_SEMANTIC_PRESERVE_MIN_CELLS = 16
+
+    # B12-c: relational semantic geometry preservation
+    cfg.MODEL.CSM_SHAPE.SCDA_RELATIONAL_ENABLED = False
+    cfg.MODEL.CSM_SHAPE.SCDA_RELATIONAL_MAX_WEIGHT = 0.01
