@@ -130,3 +130,11 @@ def add_maskformer2_config(cfg):
     # B12-c: relational semantic geometry preservation
     cfg.MODEL.CSM_SHAPE.SCDA_RELATIONAL_ENABLED = False
     cfg.MODEL.CSM_SHAPE.SCDA_RELATIONAL_MAX_WEIGHT = 0.01
+
+    # Boundary-guided residual, uses existing B8 boundary expert for the gate.
+    cfg.MODEL.BGR = CN()
+    cfg.MODEL.BGR.ENABLED = False
+    cfg.MODEL.BGR.HIDDEN_DIM = 64
+    cfg.MODEL.BGR.GAIN = 0.25
+    cfg.MODEL.BGR.WARMUP_START = 1000
+    cfg.MODEL.BGR.WARMUP_END = 5000

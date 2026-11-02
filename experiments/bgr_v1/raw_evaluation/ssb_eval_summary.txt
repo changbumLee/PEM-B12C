@@ -1,0 +1,11 @@
+[cityscapes_fine_sem_seg_val]
+sem_seg/IoU: 78.51469225914671
+sem_seg/iIoU: 61.15013981755395
+sem_seg/IoU_sup: 90.50050922255615
+sem_seg/iIoU_sup: 79.22104761264113
+boundary/BF1: 60.71108747631466
+boundary/BoundaryIoU: 71.97559098342767
+boundary/BoundaryPrecision: 62.07048350354639
+boundary/BoundaryRecall: 61.358127652028685
+boundary/n_valid_class_instances: 5998
+

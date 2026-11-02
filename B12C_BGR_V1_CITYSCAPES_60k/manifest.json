@@ -1,0 +1,18 @@
+{
+  "name": "B12C_BGR_V1_CITYSCAPES_60k",
+  "git_base": "ddce1e5a8bf5d162ce4241c3c166114de1b4b6e3",
+  "dataset": "Cityscapes",
+  "max_iter": 60000,
+  "method": "Boundary-Guided Residual Refinement",
+  "files": {
+    "install_bgr_b12c.py": "59e7be5086ab7bae66beddd07d88ba8bdd2bed3d9013778966f7c755b7b15cb5",
+    "README_KO.md": "40cacc0139cd982283f27dccf97ca2d3e347ccaf9147e6f5c568286bd4abd8bf",
+    "patch_b12c.py": "4d520ce693be6196bc95a3319680c12f24bf86209b36adee81fbedf3d80813b2",
+    "VALIDATION.md": "6f0285baf3addebe737e2a9b9298347e821fc074e62a795f8622c255757c610c",
+    "run_b12c_bgr_60k.py": "b545434fbd14e665a94a320cfc2a157cc8c20402a87c001f660d1913de2df672",
+    "tests/test_runner.py": "8bf275a9358172e257cafe697aec4ed285f844b6b31eed691d39eeb3857465c0",
+    "tests/test_patcher.py": "dbe21a5cdd33ae868bf309117a610181395020c818ae200cb49571a4c2d86526",
+    "tests/test_bgr.py": "82bf31ef33c10944c82b83a300e7af6bec7e9ccec492991ce00baafd1d3fc4cd",
+    "payload/pem/modeling/pixel_decoder/bgr_refinement.py": "8e0b9ab20958bf390c00e74a5a15eeaa4151b9d1c7db43ca7902c1777a03e098"
+  }
+}
